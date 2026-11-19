@@ -56,12 +56,23 @@ def parse(html):
     return events
 
 
+def get_page(src, n):
+    sess = requests.Session()
+    sess.headers.update(HEADERS)
+    try:
+        sess.get(src.split("/speed-post-tracking")[0] + "/speed-post-tracking", timeout=20)
+    except requests.RequestException:
+        pass
+    return sess.get(src.format(n=n), timeout=25,
+                    headers={"Referer": src.split("/speed-post-tracking")[0] + "/speed-post-tracking"})
+
+
 def fetch(n):
     last = "सर्वर जवाब नहीं दे रहा"
     for src in SOURCES:
         for attempt in range(3):
             try:
-                r = requests.get(src.format(n=n), headers=HEADERS, timeout=25)
+                r = get_page(src, n)
                 if r.status_code == 200:
                     ev = parse(r.text)
                     if ev:
@@ -88,6 +99,20 @@ def track():
         return jsonify(error=err), 502
     CACHE[n] = (time.time(), ev)
     return jsonify(number=n, events=ev)
+
+
+@app.route("/debug")
+def debug():
+    n = request.args.get("n", "").strip().upper()
+    try:
+        r = get_page(SOURCES[0], n)
+        soup = BeautifulSoup(r.text, "html.parser")
+        txt = "\n".join(l.strip() for l in soup.get_text("\n").split("\n") if l.strip())
+        hints = sorted(set(re.findall(r"[\"'](/[A-Za-z0-9_/\-\.]*(?:api|track|ajax|scan)[A-Za-z0-9_/\-\.]*)[\"']", r.text)))[:20]
+        out = f"status={r.status_code} len={len(r.text)} parsed={len(parse(r.text))}\nhints={hints}\n\n{txt[:1800]}"
+    except Exception as e:
+        out = "error: " + repr(e)
+    return "<pre style='white-space:pre-wrap'>" + out.replace("<", "&lt;") + "</pre>"
 
 
 @app.route("/")
