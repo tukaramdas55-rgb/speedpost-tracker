@@ -1,6 +1,5 @@
-import re, time, json, datetime
+import re, time, json, datetime, threading
 import html as H
-from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, jsonify, request, render_template_string
@@ -59,65 +58,33 @@ def parse(html):
     return events
 
 
-def get_page(src, n):
-    sess = requests.Session()
-    sess.headers.update(HEADERS)
-    base = src.split("/speed-post-tracking")[0] + "/speed-post-tracking"
+SESS = requests.Session()
+SESS.headers.update(HEADERS)
+WARM = {"t": 0}
+STATE, LOCK = {}, threading.Lock()
+WAIT = 4          # सेकंड: इतनी देर में जो भी मिले, तुरंत दिखा दो
+RETRY_GAP = 2.5   # दोबारा कोशिश के बीच का अंतराल (पहले 6 सेकंड था)
+MAX_TRIES = 8
+
+
+def base_of(src):
+    return src.split("/speed-post-tracking")[0] + "/speed-post-tracking"
+
+
+def warm(src):
+    """Session cookie एक बार, बैकग्राउंड में लो; हर रिक्वेस्ट पर नहीं।"""
+    WARM["t"] = time.time()
     try:
-        sess.get(base, timeout=20)
+        SESS.get(base_of(src), timeout=8)
     except requests.RequestException:
         pass
-    r = sess.get(src.format(n=n), timeout=25, headers={"Referer": base})
-    r.sess = sess
-    return r
 
 
-def lw_events(r, n, log):
-    """Livewire ke zariye scan history mangwao (page ke andar ka 'refresh')."""
-    sess = r.sess
-    soup = BeautifulSoup(r.text, "html.parser")
-    m = re.search(r'data-update-uri="([^"]+)"', r.text)
-    upd = m.group(1) if m else "/livewire/update"
-    m = re.search(r'data-csrf="([^"]+)"', r.text)
-    meta = soup.find("meta", {"name": "csrf-token"})
-    csrf = m.group(1) if m else (meta.get("content", "") if meta else "")
-    url = urljoin(r.url, upd)
-    log.append(f"update_url={url} csrf={'ha' if csrf else 'nahi'}")
-    snaps = [el["wire:snapshot"] for el in soup.find_all(attrs={"wire:snapshot": True})]
-    queue = [q for q in snaps if n in q] + [q for q in snaps if n not in q]
-    log.append(f"components={len(snaps)}")
-    seen, tries = set(), 0
-    while queue and tries < 14:
-        snap = queue.pop(0)
-        if snap in seen:
-            continue
-        seen.add(snap)
-        for method in ("$refresh", "refresh_consignment"):
-            tries += 1
-            try:
-                resp = sess.post(
-                    url,
-                    json={"_token": csrf, "components": [{"snapshot": snap, "updates": {},
-                          "calls": [{"path": "", "method": method, "params": []}]}]},
-                    headers={"X-Livewire": "true", "X-CSRF-TOKEN": csrf, "Referer": r.url,
-                             "Accept": "application/json"},
-                    timeout=40)
-                if resp.status_code != 200:
-                    log.append(f"{method}: HTTP {resp.status_code} {resp.text[:200]}")
-                    continue
-                comp = resp.json()["components"][0]
-                html_out = (comp.get("effects") or {}).get("html") or ""
-                ev = parse(html_out) if html_out else []
-                log.append(f"{method}: html={len(html_out)} events={len(ev)}")
-                if ev:
-                    return ev
-                for el in BeautifulSoup(html_out, "html.parser").find_all(attrs={"wire:snapshot": True}):
-                    queue.append(el["wire:snapshot"])
-                if comp.get("snapshot") and method == "$refresh":
-                    snap = comp["snapshot"]
-            except Exception as e:
-                log.append(f"{method}: error {e!r}")
-    return []
+def get_page(src, n):
+    if time.time() - WARM["t"] > 600:
+        threading.Thread(target=warm, args=(src,), daemon=True).start()
+        WARM["t"] = time.time()
+    return SESS.get(src.format(n=n), timeout=15, headers={"Referer": base_of(src)})
 
 
 def basic_status(html_text):
@@ -147,35 +114,51 @@ def basic_status(html_text):
              "remark": "", "partial": True}]
 
 
-def fetch(n, log=None):
-    """Source site pehli baar India Post se data mangwati hai, isliye
-    poori history na mile to thodi der ruk kar dobara dekhte hain."""
-    last = "सर्वर जवाब नहीं दे रहा"
-    partial = None
+def fetch_once(n, log=None):
+    """एक कोशिश -> (पूरी हिस्ट्री, आंशिक स्थिति, त्रुटि संदेश)"""
+    err = "सर्वर जवाब नहीं दे रहा"
     for src in SOURCES:
-        for attempt in range(6):
-            try:
-                r = get_page(src, n)
-                if r.status_code == 200:
-                    ev = parse(r.text)
-                    if log is not None:
-                        log.append(f"koshish {attempt + 1}: HTTP 200, scans={len(ev)}")
-                    if ev:
-                        return ev, None
-                    partial = basic_status(r.text) or partial
-                    last = "इस नंबर का रिकॉर्ड नहीं मिला। बुकिंग के 24 घंटे तक अपडेट आने में लग सकते हैं।"
-                else:
-                    last = f"स्रोत साइट में गड़बड़ी (कोड {r.status_code})"
-                    if log is not None:
-                        log.append(f"koshish {attempt + 1}: HTTP {r.status_code}")
-            except requests.RequestException as e:
-                last = "स्रोत साइट तक पहुँच नहीं हो पाई"
+        try:
+            r = get_page(src, n)
+            if r.status_code == 200:
+                ev = parse(r.text)
                 if log is not None:
-                    log.append(f"koshish {attempt + 1}: error {e!r}")
-            time.sleep(6)
-    if partial:
-        return partial, None
-    return None, last
+                    log.append(f"HTTP 200, scans={len(ev)}")
+                if ev:
+                    return ev, None, None
+                return None, basic_status(r.text) or None, \
+                    "इस नंबर का रिकॉर्ड नहीं मिला। बुकिंग के 24 घंटे तक अपडेट आने में लग सकते हैं।"
+            err = f"स्रोत साइट में गड़बड़ी (कोड {r.status_code})"
+            if log is not None:
+                log.append(f"HTTP {r.status_code}")
+        except requests.RequestException as e:
+            err = "स्रोत साइट तक पहुँच नहीं हो पाई"
+            if log is not None:
+                log.append(f"error {e!r}")
+    return None, None, err
+
+
+def worker(n):
+    """बैकग्राउंड में चलता है; जो भी पहले मिले उसे तुरंत STATE में रख देता है,
+    ताकि यूज़र को इंतज़ार न करना पड़े।"""
+    st = STATE[n]
+    for attempt in range(MAX_TRIES):
+        ev, part, err = fetch_once(n)
+        if ev:
+            st.update(ev=ev, done=True, err=None, t=time.time())
+            return
+        if part:
+            st["ev"] = part
+        st["err"] = err
+        if attempt < MAX_TRIES - 1:
+            time.sleep(RETRY_GAP)
+    st.update(done=True, t=time.time())
+
+
+def ttl_of(st):
+    if st.get("err") and not st.get("ev"):
+        return 5
+    return 15 if st.get("ev") and st["ev"][0].get("partial") else TTL
 
 
 @app.route("/api/track")
@@ -183,24 +166,35 @@ def track():
     n = request.args.get("n", "").strip().upper()
     if not NUM_RE.match(n):
         return jsonify(error="नंबर 13 अक्षर का होना चाहिए, जैसे EY123456789IN"), 400
-    hit = CACHE.get(n)
-    if hit and time.time() - hit[0] < (15 if hit[1][0].get("partial") else TTL):
-        return jsonify(number=n, events=hit[1], cached=True)
-    ev, err = fetch(n)
-    if err:
-        return jsonify(error=err), 502
-    CACHE[n] = (time.time(), ev)
-    return jsonify(number=n, events=ev)
+    with LOCK:
+        st = STATE.get(n)
+        if st is None or (st["done"] and time.time() - st["t"] > ttl_of(st)):
+            st = STATE[n] = {"ev": None, "done": False, "err": None, "t": time.time()}
+            threading.Thread(target=worker, args=(n,), daemon=True).start()
+    end = time.time() + WAIT
+    while time.time() < end and not st["ev"] and not st["done"]:
+        time.sleep(0.1)
+    ev = st["ev"]
+    if ev:
+        return jsonify(number=n, events=ev, pending=not st["done"])
+    if st["done"]:
+        return jsonify(error=st["err"] or "सर्वर जवाब नहीं दे रहा"), 502
+    return jsonify(number=n, events=[], pending=True)
+
+
+@app.route("/ping")
+def ping():
+    return "ok"
 
 
 @app.route("/debug")
 def debug():
     n = request.args.get("n", "").strip().upper()
-    log = []
+    log, t0 = [], time.time()
     try:
-        ev, err = fetch(n, log)
-        log.append(f"natija: {len(ev or [])} entry, error={err}")
-        for e in (ev or [])[:8]:
+        ev, part, err = fetch_once(n, log)
+        log.append(f"natija: full={len(ev or [])} partial={len(part or [])} error={err} time={time.time()-t0:.1f}s")
+        for e in (ev or part or [])[:8]:
             log.append(str(e))
     except Exception as e:
         log.append("error: " + repr(e))
@@ -210,6 +204,9 @@ def debug():
 @app.route("/")
 def home():
     return render_template_string(PAGE)
+
+
+threading.Thread(target=warm, args=(SOURCES[0],), daemon=True).start()
 
 
 PAGE = r"""<!doctype html><html lang="hi"><head><meta charset="utf-8">
@@ -248,15 +245,26 @@ function chips(){const c=$('chips');c.innerHTML='';get().forEach(x=>{const d=doc
 d.innerHTML='<b>'+x+'</b><i title="हटाएँ">✕</i>';d.querySelector('b').onclick=()=>{$('n').value=x;track()};
 d.querySelector('i').onclick=()=>{put(get().filter(y=>y!==x));chips()};c.appendChild(d)})}
 function esc(s){return String(s).replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]))}
-async function track(){const n=$('n').value.trim().toUpperCase();const out=$('out');
-out.innerHTML='<div class="box sub">खोज रहे हैं… (कभी-कभी 20-30 सेकंड लगते हैं)</div>';
-try{const r=await fetch('/api/track?n='+encodeURIComponent(n));const j=await r.json();
-if(!r.ok){out.innerHTML='<div class="box err">'+esc(j.error)+'</div>';return}
-const a=get();if(!a.includes(n)){a.unshift(n);put(a.slice(0,15));chips()}
-const e=j.events;let h='<div class="box"><div class="status">'+esc(e[0].status)+'</div><div class="sub">'+esc(e[0].office)+' · '+esc(e[0].date)+' '+esc(e[0].time)+'</div>';
+const lc=n=>{try{return JSON.parse(localStorage.getItem('c_'+n)||'null')}catch(e){return null}};
+const sc=(n,e)=>{try{localStorage.setItem('c_'+n,JSON.stringify(e))}catch(x){}};
+function render(e,pending){let h='<div class="box"><div class="status">'+esc(e[0].status)+'</div><div class="sub">'+esc(e[0].office)+' · '+esc(e[0].date)+' '+esc(e[0].time)+'</div>';
 let d='';e.forEach(x=>{if(x.date&&x.date!==d){d=x.date;h+='<div class="day">'+esc(d)+'</div>'}
 h+='<div class="ev"><div class="t">'+esc(x.time)+'</div><div><div>'+esc(x.status)+'</div><div class="o">'+esc(x.office)+(x.remark&&x.remark!==x.status?' — '+esc(x.remark):'')+'</div></div></div>'});
-if(e[0].partial)h+='<div class="sub" style="margin-top:10px">पूरी स्कैन हिस्ट्री इस समय नहीं मिल पाई, सिर्फ़ मौजूदा स्थिति दिख रही है।</div>';out.innerHTML=h+'</div>'}catch(err){out.innerHTML='<div class="box err">नेटवर्क की समस्या। दोबारा कोशिश करें।</div>'}}
+if(pending)h+='<div class="sub" style="margin-top:10px">⏳ ताज़ा/पूरी हिस्ट्री लोड हो रही है…</div>';
+else if(e[0].partial)h+='<div class="sub" style="margin-top:10px">पूरी स्कैन हिस्ट्री इस समय नहीं मिल पाई, सिर्फ़ मौजूदा स्थिति दिख रही है।</div>';
+$('out').innerHTML=h+'</div>'}
+let seq=0;
+async function track(){const n=$('n').value.trim().toUpperCase();const out=$('out');const my=++seq;
+const c=lc(n);if(c)render(c,true);else out.innerHTML='<div class="box sub">खोज रहे हैं…</div>';
+for(let i=0;i<40;i++){let r,j;
+try{r=await fetch('/api/track?n='+encodeURIComponent(n));j=await r.json()}
+catch(err){if(my===seq&&!c)out.innerHTML='<div class="box err">नेटवर्क की समस्या। दोबारा कोशिश करें।</div>';return}
+if(my!==seq)return;
+if(!r.ok){if(!c)out.innerHTML='<div class="box err">'+esc(j.error)+'</div>';return}
+if(j.events.length){const a=get();if(!a.includes(n)){a.unshift(n);put(a.slice(0,15));chips()}
+if(!j.pending||!j.events[0].partial)sc(n,j.events);render(j.events,j.pending)}
+if(!j.pending)return;
+await new Promise(s=>setTimeout(s,2000))}}
 $('go').onclick=track;$('n').addEventListener('keydown',e=>{if(e.key==='Enter')track()});
 chips();const q=new URLSearchParams(location.search).get('n');if(q){$('n').value=q;track()}
 </script></body></html>"""
