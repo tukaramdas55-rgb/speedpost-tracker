@@ -146,22 +146,34 @@ def basic_status(html_text):
              "remark": "", "partial": True}]
 
 
-def fetch(n):
+def fetch(n, log=None):
+    """Source site pehli baar India Post se data mangwati hai, isliye
+    poori history na mile to thodi der ruk kar dobara dekhte hain."""
     last = "सर्वर जवाब नहीं दे रहा"
+    partial = None
     for src in SOURCES:
-        for attempt in range(3):
+        for attempt in range(4):
             try:
                 r = get_page(src, n)
                 if r.status_code == 200:
-                    ev = parse(r.text) or lw_events(r, n, []) or basic_status(r.text)
+                    ev = parse(r.text)
+                    if log is not None:
+                        log.append(f"koshish {attempt + 1}: HTTP 200, scans={len(ev)}")
                     if ev:
                         return ev, None
+                    partial = basic_status(r.text) or partial
                     last = "इस नंबर का रिकॉर्ड नहीं मिला। बुकिंग के 24 घंटे तक अपडेट आने में लग सकते हैं।"
-                    break
-                last = f"स्रोत साइट में गड़बड़ी (कोड {r.status_code})"
-            except requests.RequestException:
+                else:
+                    last = f"स्रोत साइट में गड़बड़ी (कोड {r.status_code})"
+                    if log is not None:
+                        log.append(f"koshish {attempt + 1}: HTTP {r.status_code}")
+            except requests.RequestException as e:
                 last = "स्रोत साइट तक पहुँच नहीं हो पाई"
-            time.sleep(2 * (attempt + 1))
+                if log is not None:
+                    log.append(f"koshish {attempt + 1}: error {e!r}")
+            time.sleep(5)
+    if partial:
+        return partial, None
     return None, last
 
 
@@ -171,7 +183,7 @@ def track():
     if not NUM_RE.match(n):
         return jsonify(error="नंबर 13 अक्षर का होना चाहिए, जैसे EY123456789IN"), 400
     hit = CACHE.get(n)
-    if hit and time.time() - hit[0] < TTL:
+    if hit and time.time() - hit[0] < (15 if hit[1][0].get("partial") else TTL):
         return jsonify(number=n, events=hit[1], cached=True)
     ev, err = fetch(n)
     if err:
@@ -183,18 +195,15 @@ def track():
 @app.route("/debug")
 def debug():
     n = request.args.get("n", "").strip().upper()
+    log = []
     try:
-        r = get_page(SOURCES[0], n)
-        log = [f"status={r.status_code} len={len(r.text)} parsed={len(parse(r.text))}"]
-        ev = lw_events(r, n, log)
-        log.append(f"livewire_events={len(ev)}")
-        for e in ev[:6]:
+        ev, err = fetch(n, log)
+        log.append(f"natija: {len(ev or [])} entry, error={err}")
+        for e in (ev or [])[:8]:
             log.append(str(e))
-        log.append("basic=" + str(basic_status(r.text)))
-        txt = "\n".join(log)
     except Exception as e:
-        txt = "error: " + repr(e)
-    return "<pre style='white-space:pre-wrap;font-size:12px'>" + txt.replace("<", "&lt;") + "</pre>"
+        log.append("error: " + repr(e))
+    return "<pre style='white-space:pre-wrap;font-size:12px'>" + "\n".join(log).replace("<", "&lt;") + "</pre>"
 
 
 @app.route("/")
