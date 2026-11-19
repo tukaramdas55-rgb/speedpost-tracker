@@ -1,4 +1,6 @@
-import re, time
+import re, time, json, datetime
+import html as H
+from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, jsonify, request, render_template_string
@@ -59,12 +61,89 @@ def parse(html):
 def get_page(src, n):
     sess = requests.Session()
     sess.headers.update(HEADERS)
+    base = src.split("/speed-post-tracking")[0] + "/speed-post-tracking"
     try:
-        sess.get(src.split("/speed-post-tracking")[0] + "/speed-post-tracking", timeout=20)
+        sess.get(base, timeout=20)
     except requests.RequestException:
         pass
-    return sess.get(src.format(n=n), timeout=25,
-                    headers={"Referer": src.split("/speed-post-tracking")[0] + "/speed-post-tracking"})
+    r = sess.get(src.format(n=n), timeout=25, headers={"Referer": base})
+    r.sess = sess
+    return r
+
+
+def lw_events(r, n, log):
+    """Livewire ke zariye scan history mangwao (page ke andar ka 'refresh')."""
+    sess = r.sess
+    soup = BeautifulSoup(r.text, "html.parser")
+    m = re.search(r'data-update-uri="([^"]+)"', r.text)
+    upd = m.group(1) if m else "/livewire/update"
+    m = re.search(r'data-csrf="([^"]+)"', r.text)
+    meta = soup.find("meta", {"name": "csrf-token"})
+    csrf = m.group(1) if m else (meta.get("content", "") if meta else "")
+    url = urljoin(r.url, upd)
+    log.append(f"update_url={url} csrf={'ha' if csrf else 'nahi'}")
+    snaps = [el["wire:snapshot"] for el in soup.find_all(attrs={"wire:snapshot": True})]
+    queue = [q for q in snaps if n in q] + [q for q in snaps if n not in q]
+    log.append(f"components={len(snaps)}")
+    seen, tries = set(), 0
+    while queue and tries < 14:
+        snap = queue.pop(0)
+        if snap in seen:
+            continue
+        seen.add(snap)
+        for method in ("$refresh", "refresh_consignment"):
+            tries += 1
+            try:
+                resp = sess.post(
+                    url,
+                    json={"_token": csrf, "components": [{"snapshot": snap, "updates": {},
+                          "calls": [{"path": "", "method": method, "params": []}]}]},
+                    headers={"X-Livewire": "true", "X-CSRF-TOKEN": csrf, "Referer": r.url,
+                             "Accept": "application/json"},
+                    timeout=40)
+                if resp.status_code != 200:
+                    log.append(f"{method}: HTTP {resp.status_code} {resp.text[:200]}")
+                    continue
+                comp = resp.json()["components"][0]
+                html_out = (comp.get("effects") or {}).get("html") or ""
+                ev = parse(html_out) if html_out else []
+                log.append(f"{method}: html={len(html_out)} events={len(ev)}")
+                if ev:
+                    return ev
+                for el in BeautifulSoup(html_out, "html.parser").find_all(attrs={"wire:snapshot": True}):
+                    queue.append(el["wire:snapshot"])
+                if comp.get("snapshot") and method == "$refresh":
+                    snap = comp["snapshot"]
+            except Exception as e:
+                log.append(f"{method}: error {e!r}")
+    return []
+
+
+def basic_status(html_text):
+    """Agar history na mile, to kam se kam maujooda sthiti dikhao."""
+    raw = H.unescape(html_text)
+
+    def val(key):
+        m = re.search(r'"key":"%s","label":"[^"]*","value":"((?:[^"\\]|\\.)*)"' % key, raw)
+        if not m:
+            return ""
+        try:
+            return json.loads('"' + m.group(1) + '"')
+        except Exception:
+            return m.group(1)
+
+    st = re.sub(r"^[^\w]+", "", val("current_status"))
+    if not st:
+        return []
+    date = time_ = ""
+    try:
+        d = datetime.datetime.fromisoformat(val("last_updated_at").replace("Z", "+00:00"))
+        d += datetime.timedelta(hours=5, minutes=30)
+        date, time_ = d.strftime("%a, %d %b %Y"), d.strftime("%I:%M %p").lstrip("0")
+    except Exception:
+        pass
+    return [{"date": date, "time": time_, "office": val("delivery_location"), "status": st,
+             "remark": "", "partial": True}]
 
 
 def fetch(n):
@@ -74,7 +153,7 @@ def fetch(n):
             try:
                 r = get_page(src, n)
                 if r.status_code == 200:
-                    ev = parse(r.text)
+                    ev = parse(r.text) or lw_events(r, n, []) or basic_status(r.text)
                     if ev:
                         return ev, None
                     last = "इस नंबर का रिकॉर्ड नहीं मिला। बुकिंग के 24 घंटे तक अपडेट आने में लग सकते हैं।"
@@ -103,21 +182,19 @@ def track():
 
 @app.route("/debug")
 def debug():
-    import html as H
     n = request.args.get("n", "").strip().upper()
     try:
         r = get_page(SOURCES[0], n)
-        raw = H.unescape(r.text)
-        out = [f"status={r.status_code} len={len(r.text)} parsed={len(parse(r.text))}"]
-        for key in ["fetch(", "axios", "XMLHttpRequest", "$.ajax", "$.get", "$.post", "wire:", "x-data", "/api/", "Out For Delivery", "Dhorimana", "Murlipura"]:
-            idx = [m.start() for m in re.finditer(re.escape(key), raw)][:2]
-            out.append(f"\n### {key}: {len(re.findall(re.escape(key), raw))} milte hain")
-            for i in idx:
-                out.append("..." + raw[max(0, i - 150): i + 350].replace("\n", " ") + "...")
-        txt = "\n".join(out)
+        log = [f"status={r.status_code} len={len(r.text)} parsed={len(parse(r.text))}"]
+        ev = lw_events(r, n, log)
+        log.append(f"livewire_events={len(ev)}")
+        for e in ev[:6]:
+            log.append(str(e))
+        log.append("basic=" + str(basic_status(r.text)))
+        txt = "\n".join(log)
     except Exception as e:
         txt = "error: " + repr(e)
-    return "<pre style='white-space:pre-wrap;font-size:11px'>" + txt.replace("<", "&lt;") + "</pre>"
+    return "<pre style='white-space:pre-wrap;font-size:12px'>" + txt.replace("<", "&lt;") + "</pre>"
 
 
 @app.route("/")
@@ -167,9 +244,9 @@ try{const r=await fetch('/api/track?n='+encodeURIComponent(n));const j=await r.j
 if(!r.ok){out.innerHTML='<div class="box err">'+esc(j.error)+'</div>';return}
 const a=get();if(!a.includes(n)){a.unshift(n);put(a.slice(0,15));chips()}
 const e=j.events;let h='<div class="box"><div class="status">'+esc(e[0].status)+'</div><div class="sub">'+esc(e[0].office)+' · '+esc(e[0].date)+' '+esc(e[0].time)+'</div>';
-let d='';e.forEach(x=>{if(x.date!==d){d=x.date;h+='<div class="day">'+esc(d)+'</div>'}
+let d='';e.forEach(x=>{if(x.date&&x.date!==d){d=x.date;h+='<div class="day">'+esc(d)+'</div>'}
 h+='<div class="ev"><div class="t">'+esc(x.time)+'</div><div><div>'+esc(x.status)+'</div><div class="o">'+esc(x.office)+(x.remark&&x.remark!==x.status?' — '+esc(x.remark):'')+'</div></div></div>'});
-out.innerHTML=h+'</div>'}catch(err){out.innerHTML='<div class="box err">नेटवर्क की समस्या। दोबारा कोशिश करें।</div>'}}
+if(e[0].partial)h+='<div class="sub" style="margin-top:10px">पूरी स्कैन हिस्ट्री इस समय नहीं मिल पाई, सिर्फ़ मौजूदा स्थिति दिख रही है।</div>';out.innerHTML=h+'</div>'}catch(err){out.innerHTML='<div class="box err">नेटवर्क की समस्या। दोबारा कोशिश करें।</div>'}}
 $('go').onclick=track;$('n').addEventListener('keydown',e=>{if(e.key==='Enter')track()});
 chips();const q=new URLSearchParams(location.search).get('n');if(q){$('n').value=q;track()}
 </script></body></html>"""
