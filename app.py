@@ -20,6 +20,7 @@ DATE_RE = re.compile(r"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{1,2} [A-Za-z]{3} \d{4}
 TIME_RE = re.compile(r"^\d{1,2}:\d{2}\s?(AM|PM)$", re.I)
 SCANS_RE = re.compile(r"^\d+ scans?$", re.I)
 STOP = ("Scan QR Code", "How to Check", "Show ")
+BADGES = {"NEW", "DELIVERED"}
 CACHE, TTL = {}, 120
 
 
@@ -40,19 +41,19 @@ def parse(html):
             started, date = True, re.split(r" ·", l)[0].strip()
         elif started and TIME_RE.match(l):
             t, i = l, i + 1
-            while i < len(lines) and (lines[i].isdigit() or not has_text(lines[i]) or lines[i] == "NEW"):
+            while i < len(lines) and (lines[i].isdigit() or not has_text(lines[i]) or lines[i] in BADGES):
                 i += 1
             status = re.sub(r"^[^\w]+", "", lines[i]) if i < len(lines) else ""
             remark = ""
             j = i + 1
-            while j < len(lines) and (not has_text(lines[j]) or lines[j] == "NEW"):
+            while j < len(lines) and (not has_text(lines[j]) or lines[j] in BADGES):
                 j += 1
             if j < len(lines) and lines[j].startswith("Remarks"):
                 remark = lines[j].split(":", 1)[1].strip() if ":" in lines[j] and lines[j].split(":", 1)[1].strip() else (lines[j + 1] if j + 1 < len(lines) else "")
                 i = j + (2 if lines[j].rstrip().endswith(":") else 0)
                 i = max(i, j)
             events.append({"date": date, "time": t, "office": office, "status": status, "remark": remark})
-        elif started and has_text(l) and not SCANS_RE.match(l) and l != "NEW" and not l.isdigit():
+        elif started and has_text(l) and not SCANS_RE.match(l) and l not in BADGES and not l.startswith("Remarks") and not l.isdigit():
             office = l
         i += 1
     return events
@@ -152,7 +153,7 @@ def fetch(n, log=None):
     last = "सर्वर जवाब नहीं दे रहा"
     partial = None
     for src in SOURCES:
-        for attempt in range(4):
+        for attempt in range(6):
             try:
                 r = get_page(src, n)
                 if r.status_code == 200:
@@ -171,7 +172,7 @@ def fetch(n, log=None):
                 last = "स्रोत साइट तक पहुँच नहीं हो पाई"
                 if log is not None:
                     log.append(f"koshish {attempt + 1}: error {e!r}")
-            time.sleep(5)
+            time.sleep(6)
     if partial:
         return partial, None
     return None, last
