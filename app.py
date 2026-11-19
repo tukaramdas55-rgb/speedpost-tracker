@@ -103,16 +103,21 @@ def track():
 
 @app.route("/debug")
 def debug():
+    import html as H
     n = request.args.get("n", "").strip().upper()
     try:
         r = get_page(SOURCES[0], n)
-        soup = BeautifulSoup(r.text, "html.parser")
-        txt = "\n".join(l.strip() for l in soup.get_text("\n").split("\n") if l.strip())
-        hints = sorted(set(re.findall(r"[\"'](/[A-Za-z0-9_/\-\.]*(?:api|track|ajax|scan)[A-Za-z0-9_/\-\.]*)[\"']", r.text)))[:20]
-        out = f"status={r.status_code} len={len(r.text)} parsed={len(parse(r.text))}\nhints={hints}\n\n{txt[:1800]}"
+        raw = H.unescape(r.text)
+        out = [f"status={r.status_code} len={len(r.text)} parsed={len(parse(r.text))}"]
+        for key in ["fetch(", "axios", "XMLHttpRequest", "$.ajax", "$.get", "$.post", "wire:", "x-data", "/api/", "Out For Delivery", "Dhorimana", "Murlipura"]:
+            idx = [m.start() for m in re.finditer(re.escape(key), raw)][:2]
+            out.append(f"\n### {key}: {len(re.findall(re.escape(key), raw))} milte hain")
+            for i in idx:
+                out.append("..." + raw[max(0, i - 150): i + 350].replace("\n", " ") + "...")
+        txt = "\n".join(out)
     except Exception as e:
-        out = "error: " + repr(e)
-    return "<pre style='white-space:pre-wrap'>" + out.replace("<", "&lt;") + "</pre>"
+        txt = "error: " + repr(e)
+    return "<pre style='white-space:pre-wrap;font-size:11px'>" + txt.replace("<", "&lt;") + "</pre>"
 
 
 @app.route("/")
