@@ -1,5 +1,6 @@
 import re, time, json, datetime, threading
 import html as H
+from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, jsonify, request, render_template_string
@@ -64,7 +65,7 @@ WARM = {"t": 0}
 STATE, LOCK = {}, threading.Lock()
 WAIT = 4          # सेकंड: इतनी देर में जो भी मिले, तुरंत दिखा दो
 RETRY_GAP = 2.5   # दोबारा कोशिश के बीच का अंतराल (पहले 6 सेकंड था)
-MAX_TRIES = 8
+MAX_TRIES = 14
 
 
 def base_of(src):
@@ -80,11 +81,72 @@ def warm(src):
         pass
 
 
-def get_page(src, n):
+def get_page(src, n, fresh=False):
+    """fresh=True: नई session + वार्म-अप (पुराने कोड जैसा), जब तेज़ तरीके से रिकॉर्ड न मिले।"""
+    if fresh:
+        s = requests.Session()
+        s.headers.update(HEADERS)
+        try:
+            s.get(base_of(src), timeout=10)
+        except requests.RequestException:
+            pass
+        r = s.get(src.format(n=n), timeout=20, headers={"Referer": base_of(src)})
+        r.sess = s
+        return r
     if time.time() - WARM["t"] > 600:
         threading.Thread(target=warm, args=(src,), daemon=True).start()
         WARM["t"] = time.time()
-    return SESS.get(src.format(n=n), timeout=15, headers={"Referer": base_of(src)})
+    r = SESS.get(src.format(n=n), timeout=15, headers={"Referer": base_of(src)})
+    r.sess = SESS
+    return r
+
+
+def lw_events(r, n, log):
+    """Livewire ke zariye scan history mangwao (page ke andar ka 'refresh')."""
+    sess = r.sess
+    soup = BeautifulSoup(r.text, "html.parser")
+    m = re.search(r'data-update-uri="([^"]+)"', r.text)
+    upd = m.group(1) if m else "/livewire/update"
+    m = re.search(r'data-csrf="([^"]+)"', r.text)
+    meta = soup.find("meta", {"name": "csrf-token"})
+    csrf = m.group(1) if m else (meta.get("content", "") if meta else "")
+    url = urljoin(r.url, upd)
+    log.append(f"update_url={url} csrf={'ha' if csrf else 'nahi'}")
+    snaps = [el["wire:snapshot"] for el in soup.find_all(attrs={"wire:snapshot": True})]
+    queue = [q for q in snaps if n in q] + [q for q in snaps if n not in q]
+    log.append(f"components={len(snaps)}")
+    seen, tries = set(), 0
+    while queue and tries < 6:
+        snap = queue.pop(0)
+        if snap in seen:
+            continue
+        seen.add(snap)
+        for method in ("$refresh", "refresh_consignment"):
+            tries += 1
+            try:
+                resp = sess.post(
+                    url,
+                    json={"_token": csrf, "components": [{"snapshot": snap, "updates": {},
+                          "calls": [{"path": "", "method": method, "params": []}]}]},
+                    headers={"X-Livewire": "true", "X-CSRF-TOKEN": csrf, "Referer": r.url,
+                             "Accept": "application/json"},
+                    timeout=15)
+                if resp.status_code != 200:
+                    log.append(f"{method}: HTTP {resp.status_code} {resp.text[:200]}")
+                    continue
+                comp = resp.json()["components"][0]
+                html_out = (comp.get("effects") or {}).get("html") or ""
+                ev = parse(html_out) if html_out else []
+                log.append(f"{method}: html={len(html_out)} events={len(ev)}")
+                if ev:
+                    return ev
+                for el in BeautifulSoup(html_out, "html.parser").find_all(attrs={"wire:snapshot": True}):
+                    queue.append(el["wire:snapshot"])
+                if comp.get("snapshot") and method == "$refresh":
+                    snap = comp["snapshot"]
+            except Exception as e:
+                log.append(f"{method}: error {e!r}")
+    return []
 
 
 def basic_status(html_text):
@@ -114,16 +176,22 @@ def basic_status(html_text):
              "remark": "", "partial": True}]
 
 
-def fetch_once(n, log=None):
+def fetch_once(n, log=None, fresh=False):
     """एक कोशिश -> (पूरी हिस्ट्री, आंशिक स्थिति, त्रुटि संदेश)"""
     err = "सर्वर जवाब नहीं दे रहा"
     for src in SOURCES:
         try:
-            r = get_page(src, n)
+            r = get_page(src, n, fresh)
             if r.status_code == 200:
                 ev = parse(r.text)
                 if log is not None:
                     log.append(f"HTTP 200, scans={len(ev)}")
+                if ev:
+                    return ev, None, None
+                try:  # पेज में इतिहास नहीं मिला: Livewire "refresh" से माँगो
+                    ev = lw_events(r, n, log if log is not None else [])
+                except Exception:
+                    ev = []
                 if ev:
                     return ev, None, None
                 return None, basic_status(r.text) or None, \
@@ -143,7 +211,7 @@ def worker(n):
     ताकि यूज़र को इंतज़ार न करना पड़े।"""
     st = STATE[n]
     for attempt in range(MAX_TRIES):
-        ev, part, err = fetch_once(n)
+        ev, part, err = fetch_once(n, fresh=(attempt % 3 == 2))
         if ev:
             st.update(ev=ev, done=True, err=None, t=time.time())
             return
